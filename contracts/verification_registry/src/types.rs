@@ -25,6 +25,12 @@ pub enum TrustLevel {
 }
 
 /// A verification claim attested on-chain by a registered verifier.
+///
+/// The SEP-58 build-environment fields (`build_image_digest`,
+/// `toolchain_version`) extend the basic claim so a downstream consumer
+/// can independently reproduce the build and differentiate between
+/// attestations performed in different pinned environments.
+/// Spec: SEP-58 draft (May 2026), `build_image` and `toolchain` fields.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VerificationRecord {
@@ -45,6 +51,16 @@ pub struct VerificationRecord {
     /// Ledger timestamp at which the attestation was recorded. Set by
     /// the contract on `attest`, not trusted from the caller.
     pub timestamp: u64,
+    /// SEP-58 `build_image`: OCI image digest (e.g.
+    /// `sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`)
+    /// of the build environment the verifier used to reproduce the Wasm.
+    /// Empty string is acceptable for legacy records; the hosted verifier
+    /// always populates this.
+    pub build_image_digest: String,
+    /// SEP-58 `toolchain`: toolchain channel + version string used for
+    /// the rebuild (e.g. `stable-1.78.0`). Empty string is acceptable
+    /// for legacy records; the hosted verifier always populates this.
+    pub toolchain_version: String,
 }
 
 /// Metadata about a registered verifier. The registry is multi-verifier
@@ -62,17 +78,74 @@ pub struct VerifierInfo {
     pub active: bool,
 }
 
-/// Storage keys. Verifications and verifiers live in persistent storage;
-/// the admin lives in instance storage.
+/// Optional conflict-resolution policy that governance can configure
+/// for the canonical `Verification(contract_id)` record.
+///
+/// The default value (`LastWriteWins`) preserves the existing behaviour
+/// so deployments prior to this feature keep working unchanged. Once
+/// governance sets a different policy, it applies to *subsequent*
+/// attestations for that contract — historical canonical records
+/// already published under a prior policy are not backfilled, since
+/// the on-chain evidence lives on either way
+/// (`VerifierAttestation` is always written).
+///
+/// Spec-traceability: addresses the gap the README documents as
+/// "among active verifiers, attestation is last-write-wins per
+/// contract". Once independent verifiers exist, downstream consumers
+/// (lending protocols, etc.) need a way to distinguish a single-
+/// verifier attestation from a multi-verifier consensus or from a
+/// contested result.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum VerificationPolicy {
+    /// (default) Most-recent `attest` wins. Equivalent to the
+    /// pre-M5 behaviour.
+    LastWriteWins,
+    /// Canonical record is published only once at least `n`
+    /// *active*, independent verifiers have attested to the same
+    /// `wasm_hash` for the contract. While the quorum has not yet
+    /// been reached, the canonical entry remains absent so
+    /// downstream consumers see "contested / under-verified"
+    /// rather than a misleading single-verifier claim.
+    MinQuorum(u32),
+    /// The canonical record's `trust_level` is the minimum across
+    /// all currently-active per-verifier attestations. Recomputed
+    /// when a verifier is deactivated (on subsequent attestations to
+    /// the affected contracts).
+    LowestTrust,
+}
+
+/// Storage keys. Verifications and verifier attestations live in
+/// persistent storage; the admin and the active policy live in
+/// instance storage.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
-    /// `Verification(contract_id)` → `VerificationRecord`
+    /// `Verification(contract_id)` → canonical `VerificationRecord`.
+    /// What a downstream consumer reads via `get_verification`.
     Verification(Address),
-    /// `Verifier(address)` → `VerifierInfo`
+    /// `Verifier(address)` → `VerifierInfo`.
     Verifier(Address),
     /// Multi-sig admin address (governance).
     Admin,
+    /// Instance storage → active `VerificationPolicy` (governance).
+    Policy,
+    /// Persistent: per-(contract, verifier) attestation record. Always
+    /// written on `attest` alongside the canonical record, so the
+    /// policy aggregates have a source of truth even when only
+    /// `LastWriteWins` is in effect. Stored independently because
+    /// `MinQuorum` / `LowestTrust` need to see *all* active
+    /// verifiers, not just the last writer.
+    VerifierAttestation(Address, Address),
+    /// Persistent: `Vec<Address>` of verifiers that have ever
+    /// attested to `contract_id`. Kept across policy changes and
+    /// across verifier deactivations so we can recompute aggregates
+    /// from a stable evidence trail.
+    ContractVerifiers(Address),
+    /// Persistent: reverse index of contracts a verifier has ever
+    /// attested to. Lets `set_verifier` recompute policy state
+    /// quickly on deactivation under `LowestTrust`.
+    VerifierContracts(Address),
 }
 
 #[contracterror]
@@ -82,8 +155,12 @@ pub enum Error {
     AlreadyInitialized = 1,
     /// `init` has not been called yet.
     NotInitialized = 2,
-    /// Caller is not a registered, active verifier.
+    /// Caller is not a registered, active verifier (or admin, where
+    /// allowed).
     UnauthorizedVerifier = 3,
     /// No verification record exists for the given contract.
     VerificationNotFound = 4,
+    /// `set_policy(MinQuorum(0))` — a zero quorum would deadlock
+    /// reads and is rejected at the gate.
+    InvalidPolicy = 5,
 }

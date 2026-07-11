@@ -6,9 +6,11 @@ The **on-chain source of truth for verification results**. Any wallet, explorer,
 
 | Key | Value | Storage |
 |---|---|---|
-| `Verification(ContractId)` | `VerificationRecord { wasm_hash, repo_url, commit_sha, trust_level, verifier, sep55_attestation_ref, timestamp }` | persistent |
+| `Verification(ContractId)` | `VerificationRecord { wasm_hash, repo_url, commit_sha, trust_level, verifier, sep55_attestation_ref, timestamp, build_image_digest, toolchain_version }` | persistent |
 | `Verifier(Address)` | `VerifierInfo { name, pubkey, active }` | persistent |
 | `Admin` | Multi-sig admin address (governance) | instance |
+
+The two `build_image_digest` / `toolchain_version` fields are SEP-58 build-environment metadata. Empty string is tolerated for legacy records; the hosted verifier always populates them. See `types.rs` for the SEP-58 spec pointers.
 
 ## Interface
 
@@ -35,7 +37,31 @@ fn get_verifier(env: Env, verifier: Address) -> Option<VerifierInfo>;
 /// Governance: rotate the admin address.
 fn set_admin(env: Env, new_admin: Address) -> Result<(), Error>;
 fn get_admin(env: Env) -> Result<Address, Error>;
+
+/// Permissionless: refresh the TTL of an existing verification record
+/// (for high-value, long-lived attestations whose verifier doesn't want
+/// to re-attest just to keep storage alive). Errors with
+/// `VerificationNotFound` when `contract_id` has no on-chain record.
+fn bump_ttl(env: Env, contract_id: Address) -> Result<(), Error>;
+
+/// Permissionless: refresh the TTL of an existing verifier entry.
+/// Errors with `UnauthorizedVerifier` when `verifier` is not registered.
+fn bump_verifier_ttl(env: Env, verifier: Address) -> Result<(), Error>;
 ```
+
+## Conflict-resolution policy
+
+A downstream consumer (e.g. a lending protocol checking `trust_level >= Auditable`) needs to be able to tell the difference between a single-verifier attestation, a multi-verifier consensus, and a contested result. Governance can configure a `VerificationPolicy` for the canonical `Verification(contract_id)` record.
+
+| Variant | Default? | Semantics |
+|---|---|---|
+| `LastWriteWins` | yes | Most-recent `attest` becomes the canonical record. Equivalent to the pre-M5 behaviour. Preserved as the default so deployments prior to this feature remain bit-for-bit compatible. |
+| `MinQuorum(u32)` | no | Canonical is published only once at least *n* `n` active, independent verifiers have attested to the same `wasm_hash`. While the quorum is not met, `get_verification` returns `None` — downstream consumers see "contested / under-verified" rather than a misleading single-verifier claim. `MinQuorum(0)` is rejected at the gate with `InvalidPolicy`. |
+| `LowestTrust` | no | The canonical record's `trust_level` is the minimum across all currently-active per-verifier attestations; the record carrying that minimum is selected. When a verifier is later deactivated (`set_verifier(active=false)`) the canonical is recomputed against the remaining active attestations. |
+
+Once a policy is set, it applies to *subsequent* attestations for that contract. Historical canonical records already published under a prior policy are not backfilled, because the per-verifier evidence lives on either way (`VerifierAttestation` is always written alongside the canonical).
+
+`revoke` is intentionally a safety hatch: regardless of the active policy, it forces the canonical record to `TrustLevel::Failed` immediately (and the revoking verifier's per-verifier record to `Failed`), so wallets and lending protocols see a compromised attestation without waiting for a quorum to re-form.
 
 ## Trust levels
 
